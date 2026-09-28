@@ -1,0 +1,518 @@
+"""The worker: the only process that drives a browser.
+
+Keeping this separate from the API is a hard rule, not a preference. Playwright
+is async and a scrape can run for minutes; if request handlers drove it, the
+browser profile and the event loop would be contended by whoever happened to
+hit an endpoint.
+
+Here the API only ever writes rows to the ``jobs`` table. This process leases
+them, does the work, and is the sole owner of the browser session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+import time
+from typing import Any, Callable, Optional
+
+from app import campaigns as campaign_repo
+from app import deals as deal_repo
+from app import inbox, jobs, leads as lead_repo, territories as territory_repo
+from app.agent import planner
+from app.agent.analyst import score_lead_with_llm
+from app.agent.chat_reader import SessionExpired
+from app.agent.chronicler import daily_brief
+from app.agent.closer import NotNegotiable, extract_terms, prepare_reply
+from app.agent.router import plan_route
+from app.agent.scout import research_territory
+from app.database import get_connection, get_listings, init_db
+from app.jobs import JobType
+from app.listing_detail import scrape_listing_detail
+from app.models import DealState, Job
+from app.messaging_errors import DeliveryUnconfirmed, MessageRejected
+from app.policy import freeze_sending
+from app.send_budget import SendingFrozen
+
+logger = logging.getLogger(__name__)
+
+POLL_INTERVAL_SECONDS = 5.0
+#: While jobs are flowing, replanning often is wasted work.
+PLANNER_TICK_SECONDS = 300.0
+#: When the queue drains, the last job may have unblocked the next stage —
+#: routing creates stops, which create discovery. Waiting 5 minutes to notice
+#: makes a working pipeline look stalled.
+IDLE_PLANNER_TICK_SECONDS = 15.0
+STALE_AFTER_DAYS = 10
+
+
+class Worker:
+    """Leases jobs and runs them until stopped."""
+
+    def __init__(
+        self,
+        *,
+        campaign_id: Optional[int] = None,
+        headless: bool = True,
+        db_path: Optional[str] = None,
+        name: str = "worker-1",
+        role: str = "all",
+    ) -> None:
+        self.campaign_id = campaign_id
+        self.headless = headless
+        self.db_path = db_path
+        self.name = name
+        #: ``office`` plans and drafts, ``courier`` owns the browser, ``all`` is
+        #: the local single process that does both. The role narrows which job
+        #: types this worker will lease.
+        self.role = (role or "all").strip().lower()
+        self._lease_types = jobs.job_types_for_role(self.role)
+        self._stop = False
+        self._last_tick = 0.0
+        self._handlers: dict[str, Callable[[Job], Any]] = {
+            JobType.PROPOSE_TERRITORIES: self._propose_territories,
+            JobType.RESEARCH_TERRITORY: self._research_territory,
+            JobType.PLAN_ROUTE: self._plan_route,
+            JobType.DISCOVER_LEADS: self._discover_leads,
+            JobType.ENRICH_LEAD: self._enrich_lead,
+            JobType.SCORE_LEAD: self._score_lead,
+            JobType.DRAFT_OUTREACH: self._draft_outreach,
+            JobType.SEND_OUTREACH: self._send_outreach,
+            JobType.SYNC_INBOX: self._sync_inbox,
+            JobType.NEGOTIATE_DEAL: self._negotiate_deal,
+            JobType.EXTRACT_TERMS: self._extract_terms,
+            JobType.SWEEP_STALE: self._sweep_stale,
+            JobType.DAILY_BRIEF: self._daily_brief,
+            JobType.PLANNER_TICK: self._planner_tick,
+            JobType.PULL_PORTAL_CONTEXT: self._pull_portal_context,
+        }
+        #: Injected Booking.com fetcher; ``None`` keeps portal pulls a clean
+        #: no-op until a real scraper is wired (and lets tests supply a fake).
+        self._portal_fetcher = None
+
+    def stop(self) -> None:
+        """Ask the loop to finish the current job and exit."""
+        self._stop = True
+
+    async def run(self, once: bool = False) -> None:
+        """Drain the queue until stopped."""
+        scope = (
+            "all active campaigns"
+            if self.campaign_id is None
+            else f"campaign {self.campaign_id}"
+        )
+        from app.config import get_db_path
+
+        # The office owns the standing campaign; the courier only delivers, so
+        # it must not create work buckets. In single-process "all" mode the one
+        # worker sets it up.
+        if self.role in ("office", "all"):
+            planner.ensure_system_campaign(self.db_path)
+
+        logger.info(
+            "👷 %s [%s] started (%s) on %s",
+            self.name,
+            self.role,
+            scope,
+            self.db_path or get_db_path(),
+        )
+        while not self._stop:
+            jobs.reclaim_expired_leases(self.db_path)
+            await self._maybe_tick()
+
+            leased = jobs.lease(
+                self.name, types=self._lease_types, limit=1, db_path=self.db_path
+            )
+            if not leased:
+                await self._maybe_tick(idle=True)
+                if once:
+                    return
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            await self._execute(leased[0])
+            if once:
+                return
+
+    async def _maybe_tick(self, idle: bool = False) -> None:
+        # Planning is office work. A courier that also ticked would just do the
+        # same idempotent enqueue twice; keeping it to one role is tidier.
+        if self.role == "courier":
+            return
+        interval = IDLE_PLANNER_TICK_SECONDS if idle else PLANNER_TICK_SECONDS
+        if time.time() - self._last_tick < interval:
+            return
+        self._last_tick = time.time()
+        await asyncio.to_thread(planner.plan_tick, self.campaign_id, self.db_path)
+
+    async def _execute(self, job: Job) -> None:
+        handler = self._handlers.get(job.type)
+        if handler is None:
+            jobs.fail(job.id, f"No handler for job type {job.type!r}", self.db_path)
+            return
+
+        logger.info("▶️  %s #%s (attempt %s)", job.type, job.id, job.attempts)
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(job)
+            else:
+                # LLM calls and SQLite block. Run them off the loop, or a
+                # 13-second scout freezes the dashboard sharing this process.
+                result = await asyncio.to_thread(handler, job)
+            jobs.complete(job.id, result if isinstance(result, dict) else {}, self.db_path)
+            outcome = result.get("status", "completed") if isinstance(result, dict) else "completed"
+            logger.info("[job #%s] %s → %s", job.id, job.type, outcome)
+        except MessageRejected as exc:
+            # Airbnb refused the wording and sent nothing. The browser, the
+            # session and the queue are all fine, so only this draft failed.
+            status = jobs.fail(job.id, str(exc), self.db_path)
+            logger.error("✂️  %s #%s rejected by Airbnb (%s): %s", job.type, job.id, status.value, exc)
+        except DeliveryUnconfirmed as exc:
+            # Do not retry this job, and do not pause every other send.
+            jobs.cancel(job.id, str(exc), self.db_path)
+            logger.error("[verification required] Job #%s stopped; no automatic resend: %s", job.id, exc)
+        except SessionExpired as exc:
+            # Every browser job will fail the same way until a human signs in,
+            # and sending while logged out is how accounts get flagged.
+            jobs.cancel(job.id, str(exc), self.db_path)
+            freeze_sending(f"Airbnb session expired: {exc}", self.db_path)
+            logger.error("🔑 %s — sending frozen until you log in again", exc)
+            try:
+                from app.notify import notify_session_dead
+
+                notify_session_dead(str(exc))
+            except Exception:  # noqa: BLE001 — a ping must not mask the real error
+                logger.debug("Session notification skipped", exc_info=True)
+        except SendingFrozen as exc:
+            # Retrying would just hit the switch again; a human must release it.
+            jobs.cancel(job.id, str(exc), self.db_path)
+            logger.warning("🛑 %s #%s cancelled: %s", job.type, job.id, exc)
+        except NotNegotiable as exc:
+            jobs.cancel(job.id, str(exc), self.db_path)
+        except Exception as exc:
+            status = jobs.fail(job.id, str(exc), self.db_path)
+            logger.error("❌ %s #%s failed (%s): %s", job.type, job.id, status.value, exc)
+
+    # --- Handlers ----------------------------------------------------------
+
+    def _propose_territories(self, job: Job) -> dict:
+        from app.agent.proposer import propose_territories
+
+        return propose_territories(job_id=job.id, db_path=self.db_path)
+
+    def _pull_portal_context(self, job: Job) -> dict:
+        """Best-effort Booking.com corroboration for an enriched listing."""
+        from app import portals
+        from app.database import get_listing
+        from app.portals.booking import BookingConnector, PropertyQuery
+        from app.portals.matcher import MATCH_THRESHOLD, match_confidence
+
+        listing_id = job.payload.get("listing_id")
+        listing = _find_listing(listing_id, self.db_path) or get_listing(
+            listing_id, self.db_path
+        )
+        if listing is None:
+            return {"status": "no_listing"}
+
+        connector = BookingConnector(fetcher=self._portal_fetcher)
+        candidate = connector.fetch_context(PropertyQuery.from_listing(listing))
+        if not candidate:
+            return {"status": "no_context"}
+
+        confidence = match_confidence(listing, candidate)
+        if confidence < MATCH_THRESHOLD:
+            return {"status": "low_confidence", "confidence": confidence}
+
+        portals.save_context(
+            listing_id,
+            connector.portal,
+            candidate,
+            external_url=candidate.get("url", ""),
+            match_confidence=confidence,
+            db_path=self.db_path,
+        )
+        return {"status": "saved", "confidence": confidence, "listing_id": listing_id}
+
+    def _research_territory(self, job: Job) -> dict:
+        territory_id = int(job.payload["territory_id"])
+        territory = territory_repo.get_territory(territory_id, self.db_path)
+        if territory is None:
+            return {"skipped": "territory missing"}
+        research_territory(
+            territory_id,
+            territory.name,
+            country=territory.country,
+            job_id=job.id,
+            db_path=self.db_path,
+        )
+        return {"territory_id": territory_id}
+
+    def _plan_route(self, job: Job) -> dict:
+        campaign_id = int(job.payload["campaign_id"])
+        campaign = campaign_repo.get_campaign(campaign_id, self.db_path)
+        if campaign is None:
+            return {"skipped": "campaign missing"}
+
+        territories = territory_repo.researched_territories(self.db_path)
+        profiles = {
+            t.id: territory_repo.get_current_profile(t.id, self.db_path)
+            for t in territories
+        }
+        stops = plan_route(campaign, territories, profiles)
+        campaign_repo.save_stops(campaign_id, stops, self.db_path)
+
+        if not campaign.window_start:
+            logger.warning(
+                "🗺  '%s' has no travel window — planning 12 months from today. "
+                "Set one on the campaign to constrain it.",
+                campaign.name,
+            )
+        logger.info(
+            "🗺  Route for '%s': %s",
+            campaign.name,
+            " → ".join(f"{s.target_month} {s.territory_name}" for s in stops) or "(none)",
+        )
+        return {"stops": len(stops), "itinerary": [s.territory_name for s in stops]}
+
+    async def _discover_leads(self, job: Job) -> dict:
+        from app.scraper import scrape_listings
+
+        campaign_id = int(job.payload.get("campaign_id", 0))
+        territory_id = int(job.payload["territory_id"])
+        territory = territory_repo.get_territory(territory_id, self.db_path)
+        if territory is None:
+            return {"skipped": "territory missing"}
+
+        campaign = campaign_repo.get_campaign(campaign_id, self.db_path)
+        listings = await scrape_listings(
+            territory.name,
+            guests=campaign.guests if campaign else 2,
+            headless=self.headless,
+        )
+        search_id = _record_search(territory.name, listings, self.db_path)
+
+        for listing in listings:
+            lead_repo.upsert_lead(
+                listing.id,
+                campaign_id=campaign_id,
+                territory_id=territory_id,
+                search_id=search_id,
+                db_path=self.db_path,
+            )
+        territory_repo.record_discovery(territory_id, len(listings), self.db_path)
+
+        if not listings:
+            # A place that surfaced no listings is not worth the office's time.
+            # Retiring it makes room for the Proposer to replace it — the
+            # self-healing "change the plan and keep hunting" behaviour.
+            from app.models import TerritoryStatus
+
+            territory_repo.set_status(
+                territory_id, TerritoryStatus.EXHAUSTED, self.db_path
+            )
+            logger.info("🪫 %s yielded no listings — retired", territory.name)
+
+        return {"territory": territory.name, "leads": len(listings)}
+
+    async def _enrich_lead(self, job: Job) -> dict:
+        lead_id = int(job.payload["lead_id"])
+        lead = lead_repo.get_lead(lead_id, self.db_path)
+        if lead is None:
+            return {"skipped": "lead missing"}
+
+        listing = _find_listing(lead.listing_id, self.db_path)
+        detail = await scrape_listing_detail(
+            lead.listing_id,
+            url=listing.url if listing else "",
+            headless=self.headless,
+        )
+        lead_repo.save_enrichment(lead_id, detail, self.db_path)
+        return {"lead_id": lead_id, "amenities": len(detail.get("amenities", []))}
+
+    def _score_lead(self, job: Job) -> dict:
+        lead_id = int(job.payload["lead_id"])
+        lead = lead_repo.get_lead(lead_id, self.db_path)
+        if lead is None:
+            return {"skipped": "lead missing"}
+
+        listing = _find_listing(lead.listing_id, self.db_path)
+        score, breakdown, rationale = score_lead_with_llm(
+            lead, listing, job_id=job.id, db_path=self.db_path
+        )
+        lead_repo.save_score(lead_id, score, breakdown, rationale, self.db_path)
+
+        deal_id = deal_repo.upsert_deal(
+            lead.listing_id,
+            campaign_id=lead.campaign_id,
+            lead_id=lead_id,
+            territory_id=lead.territory_id,
+            host_name=listing.host_name if listing else "",
+            place_name=listing.title if listing else "",
+            location=listing.location if listing else "",
+            listing_url=listing.url if listing else "",
+            db_path=self.db_path,
+        )
+        deal_repo.advance_to(
+            deal_id,
+            DealState.QUALIFIED,
+            reason=f"score {score:.2f}",
+            actor="analyst",
+            db_path=self.db_path,
+        )
+        return {"lead_id": lead_id, "score": score}
+
+    def _draft_outreach(self, job: Job) -> dict:
+        from app.agent.scribe import prepare_outreach
+
+        prepared = prepare_outreach(
+            int(job.payload["lead_id"]),
+            job_id=job.id,
+            db_path=self.db_path,
+            for_draft=True,
+        )
+        # Keep the job result small and free of the Listing object.
+        return {k: v for k, v in prepared.items() if k not in ("listing", "message")}
+
+    async def _send_outreach(self, job: Job) -> dict:
+        from app.agent.scribe import deliver_outreach_for_lead
+
+        return await deliver_outreach_for_lead(
+            int(job.payload["lead_id"]),
+            headless=self.headless,
+            job_id=job.id,
+            db_path=self.db_path,
+        )
+
+    async def _sync_inbox(self, job: Job) -> dict:
+        return await inbox.sync_inbox(
+            max_threads=int(job.payload.get("max_threads", 20)),
+            headless=self.headless,
+            db_path=self.db_path,
+        )
+
+    async def _negotiate_deal(self, job: Job) -> dict:
+        deal_id = int(job.payload["deal_id"])
+        prepared = prepare_reply(deal_id, job_id=job.id, db_path=self.db_path)
+        if prepared["status"] != "ready":
+            return prepared
+
+        await inbox.send_reply(
+            deal_id,
+            prepared["message_id"],
+            headless=self.headless,
+            db_path=self.db_path,
+        )
+        jobs.enqueue(
+            JobType.EXTRACT_TERMS,
+            {"deal_id": deal_id},
+            priority=jobs.Priority.INBOX_SYNC,
+            idempotency_key=f"terms:{deal_id}:{prepared['round']}",
+            deal_id=deal_id,
+            db_path=self.db_path,
+        )
+        return {"deal_id": deal_id, "status": "sent", "round": prepared["round"]}
+
+    def _extract_terms(self, job: Job) -> dict:
+        return extract_terms(
+            int(job.payload["deal_id"]), job_id=job.id, db_path=self.db_path
+        )
+
+    def _sweep_stale(self, job: Job) -> dict:
+        return sweep_stale(days=STALE_AFTER_DAYS, db_path=self.db_path)
+
+    def _daily_brief(self, job: Job) -> dict:
+        return daily_brief(self.db_path)
+
+    def _planner_tick(self, job: Job) -> dict:
+        return planner.plan_tick(self.campaign_id, self.db_path)
+
+
+def sweep_stale(days: int = STALE_AFTER_DAYS, db_path: Optional[str] = None) -> dict:
+    """Retire contacted deals the host never answered.
+
+    Without this the funnel fills with threads that will never move, and the
+    Planner keeps counting them as live pipeline.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT id FROM deals
+                WHERE state = 'contacted'
+                  AND (last_inbound_at IS NULL)
+                  AND (last_outbound_at IS NOT NULL AND last_outbound_at < ?)""",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        deal_repo.escalate_or_close(
+            int(row["id"]),
+            DealState.STALE,
+            f"no reply in {days} days",
+            actor="sweeper",
+            db_path=db_path,
+        )
+    logger.info("🧹 Swept %d stale deal(s)", len(rows))
+    return {"swept": len(rows)}
+
+
+def _record_search(location: str, listings: list, db_path: Optional[str]) -> int:
+    from app.database import create_search, save_listings, update_search_status
+    from app.models import Search, SearchStatus
+
+    search_id = create_search(Search(location=location), db_path)
+    save_listings(listings, search_id, db_path)
+    update_search_status(search_id, SearchStatus.COMPLETED, len(listings), db_path)
+    return search_id
+
+
+def _find_listing(listing_id: str, db_path: Optional[str]):
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT search_id FROM listings WHERE id = ?", (listing_id,)
+        ).fetchone()
+        search_id = row["search_id"] if row else None
+    finally:
+        conn.close()
+    if search_id is None:
+        return None
+    return next(
+        (l for l in get_listings(search_id, db_path) if l.id == listing_id), None
+    )
+
+
+def main(
+    campaign_id: Optional[int] = None,
+    headless: bool = True,
+    db_path: Optional[str] = None,
+    once: bool = False,
+    role: str = "all",
+) -> None:
+    """Run a worker until interrupted."""
+    from app.logging_config import setup_logging
+
+    setup_logging()
+    init_db(db_path)
+    worker = Worker(
+        campaign_id=campaign_id, headless=headless, db_path=db_path, role=role,
+        name=f"{role}-1" if role != "all" else "worker-1",
+    )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, lambda *_: worker.stop())
+        except ValueError:  # not on the main thread
+            pass
+
+    asyncio.run(worker.run(once=once))
+    logger.info("👷 Worker stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
