@@ -6,6 +6,7 @@ This package provides LangGraph-based AI agents that:
 2. **Outreach** — pull listing & host data and craft compelling initial messages.
 3. **Schedule** — repeat the above every N hours automatically.
 
-All agents are LLM-agnostic: configure ``LLM_PROVIDER`` (openai / gemini / perplexity)
-and the matching API key in ``.env``.
+All agents are LLM-agnostic: configure ``LLM_PROVIDER`` (openai / gemini /
+perplexity / groq, or any LiteLLM provider) and the matching API key in
+``.env``.
 """

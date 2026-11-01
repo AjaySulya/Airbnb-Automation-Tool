@@ -13,3 +13,6 @@ langgraph==0.2.60
 langchain-core==0.3.28
 langchain-openai==0.2.14
 langchain-google-genai==2.0.7
+# Universal provider layer (OpenAI, Gemini, Perplexity, Groq, …).
+# Pinned: 1.81+ requires openai>=2, which breaks langchain-openai 0.2.14.
+litellm==1.80.0

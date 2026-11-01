@@ -25,12 +25,19 @@ _PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-pro": (1.25, 10.00),
     "sonar-pro": (3.00, 15.00),
+    "llama-3.3-70b-versatile": (0.59, 0.79),
+    "llama-3.1-8b-instant": (0.05, 0.08),
 }
 
 
 def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Dollar cost of a call, or 0.0 for models with no known price."""
-    rates = _PRICING.get((model or "").lower())
+    """Dollar cost of a call, or 0.0 for models with no known price.
+
+    Accepts both bare (``gpt-4o-mini``) and LiteLLM-namespaced
+    (``openai/gpt-4o-mini``) model names.
+    """
+    name = (model or "").lower()
+    rates = _PRICING.get(name) or _PRICING.get(name.rsplit("/", 1)[-1])
     if not rates:
         return 0.0
     return (prompt_tokens * rates[0] + completion_tokens * rates[1]) / 1_000_000
@@ -118,7 +125,11 @@ def tracked_invoke(
     still shows up in the cost ledger.
     """
     model = getattr(llm, "model_name", None) or getattr(llm, "model", "") or ""
-    provider = type(llm).__name__
+    # LiteLLM models are namespaced ("groq/llama-3.3-70b-versatile"); prefer the
+    # adapter's provider label over the wrapper class name. Only a real string
+    # counts — mocks auto-create attributes, and those must not reach SQL.
+    provider_attr = getattr(llm, "provider", None)
+    provider = provider_attr if isinstance(provider_attr, str) and provider_attr else type(llm).__name__
     input_preview = "\n\n".join(str(getattr(m, "content", m)) for m in messages)
 
     started = time.perf_counter()

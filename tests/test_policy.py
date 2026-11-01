@@ -146,6 +146,13 @@ def test_unknown_model_records_zero_cost_rather_than_guessing(db):
     assert runs.estimate_cost_usd("gpt-4o-mini", 1_000_000, 0) == pytest.approx(0.15)
 
 
+def test_litellm_namespaced_model_prices_are_found(db):
+    assert runs.estimate_cost_usd(
+        "groq/llama-3.3-70b-versatile", 1_000_000, 0
+    ) == pytest.approx(0.59)
+    assert runs.estimate_cost_usd("openai/gpt-4o-mini", 0, 1_000_000) == pytest.approx(0.60)
+
+
 def test_response_without_usage_metadata_still_records(db):
     llm = _FakeLLM(_FakeResponse("ok"))
     text, run_id = runs.tracked_invoke(llm, ["p"], agent="scout")

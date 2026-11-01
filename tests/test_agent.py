@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from app.agent.chat_reader import ChatMessage, ChatThread
 from app.agent.prompts_v2 import (
     build_closer_prompt,
@@ -45,6 +48,120 @@ def test_get_llm_perplexity_provider():
     ):
         assert hasattr(get_llm(), "invoke")
     get_llm.cache_clear()
+
+
+def test_get_llm_groq_provider():
+    from app.agent.llm import get_llm
+
+    get_llm.cache_clear()
+    with patch.dict(
+        os.environ,
+        {
+            "LLM_PROVIDER": "groq",
+            "GROQ_API_KEY": "gsk-test",
+            "GROQ_MODEL": "llama-3.3-70b-versatile",
+        },
+    ):
+        llm = get_llm()
+    assert hasattr(llm, "invoke")
+    assert llm.model == "groq/llama-3.3-70b-versatile"
+    get_llm.cache_clear()
+
+
+def test_get_llm_supports_any_litellm_provider_via_model_override():
+    """A provider this file has never heard of should still work."""
+    from app.agent.llm import get_llm
+
+    get_llm.cache_clear()
+    with patch.dict(
+        os.environ,
+        {
+            "LLM_PROVIDER": "anthropic",
+            "LLM_MODEL": "anthropic/claude-sonnet-4-5",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+        },
+    ):
+        llm = get_llm()
+    assert llm.model == "anthropic/claude-sonnet-4-5"
+    get_llm.cache_clear()
+
+
+def test_llm_model_alone_is_enough_to_pick_a_provider():
+    from app.agent.llm import get_llm
+
+    get_llm.cache_clear()
+    with patch.dict(
+        os.environ,
+        {
+            "LLM_PROVIDER": "",
+            "LLM_MODEL": "groq/llama-3.3-70b-versatile",
+            "GROQ_API_KEY": "gsk-test",
+        },
+    ):
+        llm = get_llm()
+    assert llm.provider == "groq"
+    assert llm.model == "groq/llama-3.3-70b-versatile"
+    get_llm.cache_clear()
+
+
+def test_get_llm_unknown_provider_without_model_is_a_clear_error():
+    from app.agent.llm import get_llm
+
+    get_llm.cache_clear()
+    with patch.dict(os.environ, {"LLM_MODEL": ""}):
+        with pytest.raises(ValueError, match="LLM_MODEL"):
+            get_llm(provider="mystery")
+    get_llm.cache_clear()
+
+
+def test_litellm_chat_model_invoke_returns_an_aimessage(monkeypatch):
+    """The adapter must satisfy what ``runs.tracked_invoke`` reads."""
+    import litellm
+
+    from app.agent.llm import LiteLLMChatModel
+
+    captured = {}
+
+    class _Message:
+        content = "Hello host"
+
+    class _Choice:
+        message = _Message()
+        finish_reason = "stop"
+
+    class _Usage:
+        prompt_tokens = 11
+        completion_tokens = 7
+
+    class _Response:
+        choices = [_Choice()]
+        usage = _Usage()
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+
+    llm = LiteLLMChatModel(
+        model="groq/llama-3.3-70b-versatile", provider="groq", api_key="gsk-test"
+    )
+    result = llm.invoke(
+        [SystemMessage(content="be useful"), HumanMessage(content="write it")]
+    )
+
+    assert result.content == "Hello host"
+    assert result.usage_metadata == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+    }
+    assert captured["messages"] == [
+        {"role": "system", "content": "be useful"},
+        {"role": "user", "content": "write it"},
+    ]
+    assert captured["api_key"] == "gsk-test"
+    assert captured["model"] == "groq/llama-3.3-70b-versatile"
 
 
 # --- Chat reader -----------------------------------------------------------
