@@ -113,7 +113,7 @@ def test_login_dialog_is_not_reported_as_missing_composer(immediate_waits):
         async with local_page() as page:
             await page.set_content('''
                 <div role="dialog">
-                    <h1>Welcome back, Sachin</h1>
+                    <h1>Welcome back, Alex</h1>
                     <button>Log in</button>
                 </div>
             ''')

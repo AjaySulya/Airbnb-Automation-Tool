@@ -4,7 +4,7 @@ Two changes from the v1 prompts:
 
 - Identity and reach are injected from policy rather than hardcoded in the
   prompt, so the Warden validates a draft against the same facts the writer was
-  given. A prompt that hardcodes "150k followers" cannot be checked against
+  given. A prompt that hardcodes a follower count cannot be checked against
   anything.
 - The writer gets the host's own words, their bio and real guest reviews, so it
   can say something only a person who read the page would say.

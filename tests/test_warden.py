@@ -15,9 +15,8 @@ from app.warden import Rule
 
 CLEAN_DRAFT = """Hi Asha!
 
-Your place in Goa looks wonderful. I'm Sachin, a remote engineer and founder of
-The Boring Education, and I create travel content for an audience of 150k+
-followers.
+Your place in Goa looks wonderful. I'm Alex, a remote engineer and travel creator, and I create travel
+content for an audience of 10k+ followers.
 
 I'd love to stay with you in exchange for content: 2 IG reels, 10 edited
 photos and 1 honest public review. I'm flexible on timing and could come any
@@ -26,7 +25,7 @@ time in the November to December window.
 No pressure at all — happy to chat if this sounds interesting!
 
 Cheers,
-Sachin"""
+Alex"""
 
 
 @pytest.fixture
@@ -58,9 +57,9 @@ def pol():
         ],
         max_agent_replies_per_thread=4,
         credential_facts={
-            "name": "Sachin Kumar Shukla",
-            "handles": "@theboringfounder, @theboringeducation",
-            "followers": "150k+ combined",
+            "name": "Alex Doe",
+            "handles": "@alexdoe, @alexcreates",
+            "followers": "10k+ combined",
         },
         allow_off_platform_contact=False,
     )
@@ -141,7 +140,7 @@ def test_a_substring_of_a_longer_word_is_not_a_blocked_term(pol, monkeypatch):
 
 def test_a_handle_can_be_blocked_when_configured(pol, monkeypatch):
     """Airbnb withheld a real message for naming accounts, so handles are out."""
-    verdict = _review(CLEAN_DRAFT.replace("followers.", "followers on @theboringfounder."), pol)
+    verdict = _review(CLEAN_DRAFT.replace("followers.", "followers on @alexdoe."), pol)
     assert not verdict.allowed
     assert _rules(verdict) == {Rule.PLATFORM_TERMS}
     assert verdict.revisable_only is True
@@ -149,7 +148,7 @@ def test_a_handle_can_be_blocked_when_configured(pol, monkeypatch):
 
 def test_naming_an_account_is_allowed_once_a_reservation_exists(pol, monkeypatch):
     monkeypatch.setenv("ALLOW_HANDLES_BEFORE_BOOKING", "true")
-    body = CLEAN_DRAFT.replace("followers.", "followers on @theboringfounder.")
+    body = CLEAN_DRAFT.replace("followers.", "followers on @alexdoe.")
     assert _review(body, pol).allowed
 
 
@@ -168,7 +167,7 @@ def test_approved_deliverables_at_the_cap_are_allowed(pol):
 
 def test_a_whitelisted_handle_is_still_withheld_by_airbnb(pol):
     """The fact sheet permits these, but Airbnb refuses to deliver them."""
-    verdict = _review("You can see my work at @theboringfounder.", pol)
+    verdict = _review("You can see my work at @alexdoe.", pol)
     assert not verdict.allowed
     assert _rules(verdict) == {Rule.PLATFORM_TERMS}
 
@@ -181,7 +180,7 @@ def test_a_whitelisted_handle_is_still_withheld_by_airbnb(pol):
     [
         "Sounds great! Call me on 9876543210 and we can sort it out.",
         "My number is +91 98765 43210, text anytime.",
-        "Easier over email — sachin@theboringeducation.com",
+        "Easier over email — alex@example.com",
         "Let's move this to WhatsApp, much quicker.",
         "Ping me on Telegram and we'll finalise.",
         "We could skip the fees and do a direct booking.",
@@ -297,7 +296,7 @@ def test_red_team_inflated_follower_claims_are_blocked(draft, pol):
 
 
 def test_follower_claim_within_the_fact_sheet_is_allowed(pol):
-    assert _review("I have 150k followers combined.", pol).allowed
+    assert _review("I have 10k followers combined.", pol).allowed
 
 
 # --- Shape -----------------------------------------------------------------

@@ -147,20 +147,19 @@ def get_default_max_agent_replies_per_thread() -> int:
 
 
 def get_default_credential_facts() -> dict[str, str]:
-    """The claims an agent is allowed to make about who you are and your reach.
+    """The claims an agent may make about who you are and your reach.
 
     The Warden cross-checks every draft against these, so anything not listed
-    here cannot be asserted to a host.
+    here cannot be asserted to a host. The defaults are deliberately generic:
+    set ``CREATOR_NAME``, ``CREATOR_ROLE``, ``CREATOR_FOLLOWERS`` and
+    ``CREATOR_HANDLES`` before any real outreach, otherwise the agent has no
+    verified identity to write from (and a follower ceiling of zero).
     """
     return {
-        "name": (os.getenv("CREATOR_NAME") or "Sachin Kumar Shukla").strip(),
-        "role": (
-            os.getenv("CREATOR_ROLE") or "remote software engineer and founder of The Boring Education"
-        ).strip(),
-        "followers": (os.getenv("CREATOR_FOLLOWERS") or "150k+ combined").strip(),
-        "handles": (
-            os.getenv("CREATOR_HANDLES") or "@theboringfounder, @theboringeducation"
-        ).strip(),
+        "name": (os.getenv("CREATOR_NAME") or "Your Name").strip(),
+        "role": (os.getenv("CREATOR_ROLE") or "travel content creator").strip(),
+        "followers": (os.getenv("CREATOR_FOLLOWERS") or "0").strip(),
+        "handles": (os.getenv("CREATOR_HANDLES") or "").strip(),
     }
 
 

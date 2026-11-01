@@ -89,10 +89,10 @@ def _policy(**kwargs):
         allowed_deliverables=["2 IG reels", "10 edited photos"],
         max_agent_replies_per_thread=4,
         credential_facts={
-            "name": "Sachin Shukla",
-            "role": "founder of The Boring Education",
-            "followers": "150k+ combined",
-            "handles": "@theboringfounder",
+            "name": "Alex Doe",
+            "role": "travel content creator",
+            "followers": "10k+ combined",
+            "handles": "@alexdoe",
         },
     )
     base.update(kwargs)
@@ -103,11 +103,11 @@ def test_guardrail_block_states_a_free_only_rule():
     text = guardrail_block(_policy())
     assert "Never agree to pay anything" in text
     assert "2 IG reels" in text
-    assert "150k+ combined" in text
+    assert "10k+ combined" in text
 
 
 def test_guardrail_block_never_asks_for_a_handle_airbnb_would_withhold():
-    assert "@theboringfounder" not in guardrail_block(_policy())
+    assert "@alexdoe" not in guardrail_block(_policy())
 
 
 def test_guardrail_block_states_a_ceiling_when_one_is_set():
@@ -128,7 +128,7 @@ def test_scribe_prompt_carries_the_listing_context():
     )
     system, human = build_scribe_prompt(listing, lead, _policy(), "Known for beach shacks")
 
-    assert "Sachin Shukla" in system
+    assert "Alex Doe" in system
     assert "sunlit villa" in human
     assert "sunrise deck" in human
     assert "Dedicated workspace" in human
